@@ -12,11 +12,29 @@
       "value": "westeurope"
     },
 
+    /*
+      Marketplace identification (Managed Application plan).
+      These map to:
+        Publisher ID = publisher
+        Product ID   = offer
+        Plan ID      = plan
+        Plan version = planVersion
+
+      You discovered:
+        Publisher ID: veeam
+        Product ID:   azure_backup_free
+        Plan ID:      veeambackupazure_free_v6_0
+    */
     "publisher": { "value": "veeam" },
     "offer": { "value": "azure_backup_free" },
     "plan": { "value": "veeambackupazure_free_v6_0" },
     "planVersion": { "value": "6.0.234" },
 
+    /*
+      appParameters: Passed through to the managed application.
+      The exact keys depend on the specific Marketplace solution.
+      Start with an empty object, then add parameters once you confirm the required schema.
+    */
     "appParameters": {
       "value": {}
     }
