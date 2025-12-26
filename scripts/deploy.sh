@@ -55,10 +55,6 @@ if [[ "${DEPLOY_VBMA}" != "true" ]]; then
 fi
 
 # ---- Marketplace (best-effort, parameter-driven) ----
-# This section uses a simple managed application resource deployment.
-# You must ensure the offer details are correct for your subscription/region.
-# The parameters file contains publisher/offer/plan values you can adjust quickly.
-
 PARAM_FILE="marketplace/vbazure.parameters.json"
 if [[ ! -f "${PARAM_FILE}" ]]; then
   echo "ERROR: Missing ${PARAM_FILE}"
@@ -67,8 +63,9 @@ fi
 
 echo "==> Reading marketplace parameters from ${PARAM_FILE}"
 PUBLISHER="$(jq -r '.parameters.publisher.value' "${PARAM_FILE}")"
-OFFER="$(jq -r '.parameters.offer.value' "${PARAM_FILE}")"
-PLAN="$(jq -r '.parameters.plan.value' "${PARAM_FILE}")"
+OFFER="$(jq -r '.parameters.offer.value' "${PARAM_FILE}")"      # Product ID
+PLAN="$(jq -r '.parameters.plan.value' "${PARAM_FILE}")"        # Plan ID
+PLAN_VERSION="$(jq -r '.parameters.planVersion.value // empty' "${PARAM_FILE}")"
 APP_NAME="$(jq -r '.parameters.managedApplicationName.value' "${PARAM_FILE}")"
 MRG_NAME="$(jq -r '.parameters.managedResourceGroupName.value' "${PARAM_FILE}")"
 
@@ -77,15 +74,17 @@ if [[ -z "${PUBLISHER}" || -z "${OFFER}" || -z "${PLAN}" ]]; then
   exit 1
 fi
 
-echo "==> Accepting marketplace terms (publisher=${PUBLISHER}, offer=${OFFER}, plan=${PLAN})"
-az vm image terms accept --publisher "${PUBLISHER}" --offer "${OFFER}" --plan "${PLAN}" 1>/dev/null || true
+echo "==> Accepting marketplace terms (publisher=${PUBLISHER}, product=${OFFER}, plan=${PLAN}, version=${PLAN_VERSION:-<none>})"
+if [[ -n "${PLAN_VERSION}" ]]; then
+  az vm image terms accept --publisher "${PUBLISHER}" --offer "${OFFER}" --plan "${PLAN}" --version "${PLAN_VERSION}" 1>/dev/null || true
+else
+  az vm image terms accept --publisher "${PUBLISHER}" --offer "${OFFER}" --plan "${PLAN}" 1>/dev/null || true
+fi
 
 # Create managed resource group id
 MRG_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${MRG_NAME}"
 
 echo "==> Deploying Veeam Backup for Microsoft Azure managed app: ${APP_NAME}"
-# Deploy via inline ARM template for a managed application resource.
-# The "appParameters" object is passed through to the marketplace solution.
 az deployment group create \
   -g "${RG_NAME}" \
   -n "vbma-$(date +%Y%m%d%H%M%S)" \
@@ -104,6 +103,7 @@ az deployment group create \
     "publisher": { "type": "string" },
     "offer": { "type": "string" },
     "plan": { "type": "string" },
+    "planVersion": { "type": "string" },
 
     "appParameters": { "type": "object", "defaultValue": {} }
   },
@@ -117,7 +117,8 @@ az deployment group create \
       "plan": {
         "name": "[parameters('plan')]",
         "publisher": "[parameters('publisher')]",
-        "product": "[parameters('offer')]"
+        "product": "[parameters('offer')]",
+        "version": "[parameters('planVersion')]"
       },
       "properties": {
         "managedResourceGroupId": "[parameters('managedResourceGroupId')]",
