@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
 # scripts/deploy.sh
 # Deploys the baseline lab (infra/main.bicep).
 # Optionally deploys the "Veeam Backup for Microsoft Azure" marketplace managed app
@@ -39,7 +42,7 @@ echo "==> Deploying baseline lab (Bicep)"
 az deployment group create \
   -g "${RG_NAME}" \
   -n "baseline-$(date +%Y%m%d%H%M%S)" \
-  -f "infra/main.bicep" \
+  -f "${REPO_ROOT}/infra/main.bicep" \
   -p prefix="${PREFIX}" \
      location="${LOCATION}" \
      adminUsername="${ADMIN_USERNAME}" \
@@ -55,16 +58,25 @@ if [[ "${DEPLOY_VBMA}" != "true" ]]; then
 fi
 
 # ---- Marketplace (best-effort, parameter-driven) ----
-PARAM_FILE="marketplace/vbazure.parameters.json"
+# This section uses a simple managed application resource deployment.
+# You must ensure the offer details are correct for your subscription/region.
+# The parameters file contains publisher/offer/plan values you can adjust quickly.
+
+PARAM_FILE="${REPO_ROOT}/marketplace/vbazure.parameters.json"
 if [[ ! -f "${PARAM_FILE}" ]]; then
   echo "ERROR: Missing ${PARAM_FILE}"
   exit 1
 fi
 
+if ! command -v jq >/dev/null 2>&1; then
+  echo "ERROR: jq is required for marketplace deployment. Install jq or set DEPLOY_VBMA=false."
+  exit 1
+fi
+
 echo "==> Reading marketplace parameters from ${PARAM_FILE}"
 PUBLISHER="$(jq -r '.parameters.publisher.value' "${PARAM_FILE}")"
-OFFER="$(jq -r '.parameters.offer.value' "${PARAM_FILE}")"      # Product ID
-PLAN="$(jq -r '.parameters.plan.value' "${PARAM_FILE}")"        # Plan ID
+OFFER="$(jq -r '.parameters.offer.value' "${PARAM_FILE}")"
+PLAN="$(jq -r '.parameters.plan.value' "${PARAM_FILE}")"
 PLAN_VERSION="$(jq -r '.parameters.planVersion.value // empty' "${PARAM_FILE}")"
 APP_NAME="$(jq -r '.parameters.managedApplicationName.value' "${PARAM_FILE}")"
 MRG_NAME="$(jq -r '.parameters.managedResourceGroupName.value' "${PARAM_FILE}")"
@@ -74,7 +86,7 @@ if [[ -z "${PUBLISHER}" || -z "${OFFER}" || -z "${PLAN}" ]]; then
   exit 1
 fi
 
-echo "==> Accepting marketplace terms (publisher=${PUBLISHER}, product=${OFFER}, plan=${PLAN}, version=${PLAN_VERSION:-<none>})"
+echo "==> Accepting marketplace terms (publisher=${PUBLISHER}, offer=${OFFER}, plan=${PLAN}, version=${PLAN_VERSION:-<none>})"
 if [[ -n "${PLAN_VERSION}" ]]; then
   az vm image terms accept --publisher "${PUBLISHER}" --offer "${OFFER}" --plan "${PLAN}" --version "${PLAN_VERSION}" 1>/dev/null || true
 else
@@ -85,6 +97,8 @@ fi
 MRG_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${MRG_NAME}"
 
 echo "==> Deploying Veeam Backup for Microsoft Azure managed app: ${APP_NAME}"
+# Deploy via inline ARM template for a managed application resource.
+# The "appParameters" object is passed through to the marketplace solution.
 az deployment group create \
   -g "${RG_NAME}" \
   -n "vbma-$(date +%Y%m%d%H%M%S)" \
@@ -103,7 +117,6 @@ az deployment group create \
     "publisher": { "type": "string" },
     "offer": { "type": "string" },
     "plan": { "type": "string" },
-    "planVersion": { "type": "string" },
 
     "appParameters": { "type": "object", "defaultValue": {} }
   },
@@ -117,8 +130,7 @@ az deployment group create \
       "plan": {
         "name": "[parameters('plan')]",
         "publisher": "[parameters('publisher')]",
-        "product": "[parameters('offer')]",
-        "version": "[parameters('planVersion')]"
+        "product": "[parameters('offer')]"
       },
       "properties": {
         "managedResourceGroupId": "[parameters('managedResourceGroupId')]",
