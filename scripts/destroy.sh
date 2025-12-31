@@ -4,18 +4,31 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# scripts/destroy.sh
 # Destroys the whole lab by deleting the resource group.
+# Best-effort also deletes the Marketplace managed app managed RG.
 
 SUBSCRIPTION_ID="${SUBSCRIPTION_ID:-}"
 RG_NAME="${RG_NAME:-veeam-lab-rg}"
 
-# Best-effort cleanup of Marketplace managed app managed resource group (if you deployed it)
 PARAM_FILE="${REPO_ROOT}/marketplace/vbazure.parameters.json"
-if command -v jq >/dev/null 2>&1 && [[ -f "${PARAM_FILE}" ]]; then
-  MRG_NAME="$(jq -r '.parameters.managedResourceGroupName.value // empty' "${PARAM_FILE}")"
-else
-  MRG_NAME=""
+STATE_FILE="${REPO_ROOT}/.vbma.state"
+
+MRG_NAME=""
+
+# Prefer state file produced by deploy.sh (most reliable)
+if [[ -f "${STATE_FILE}" ]]; then
+  # shellcheck disable=SC1090
+  source "${STATE_FILE}" || true
+  # If sourced, it may set MRG_NAME and SUBSCRIPTION_ID
+fi
+
+# Fallback to parameter file (older behavior)
+if [[ -z "${MRG_NAME}" ]] && command -v jq >/dev/null 2>&1 && [[ -f "${PARAM_FILE}" ]]; then
+  # strip BOM defensively before jq
+  TMPP="$(mktemp -t vbazure-params-XXXXXX.json)"
+  sed '1s/^\xEF\xBB\xBF//' "${PARAM_FILE}" > "${TMPP}"
+  MRG_NAME="$(jq -r '.parameters.managedResourceGroupName.value // empty' "${TMPP}")"
+  rm -f "${TMPP}" || true
 fi
 
 if [[ -z "${SUBSCRIPTION_ID}" ]]; then
@@ -28,7 +41,6 @@ az account set --subscription "${SUBSCRIPTION_ID}"
 
 echo "==> Deleting resource group ${RG_NAME}"
 az group delete -n "${RG_NAME}" --yes --no-wait
-
 echo "==> Delete initiated: ${RG_NAME}"
 
 if [[ -n "${MRG_NAME}" ]]; then
