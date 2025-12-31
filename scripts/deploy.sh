@@ -4,10 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# scripts/deploy.sh
 # Deploys the baseline lab (infra/main.bicep).
 # Optionally deploys the "Veeam Backup for Microsoft Azure" marketplace managed app
-# using marketplace/vbazure.parameters.json (best-effort, parameterized).
+# using marketplace/vbazure.parameters.json.
 
 # ---- Required env vars (or edit defaults below) ----
 SUBSCRIPTION_ID="${SUBSCRIPTION_ID:-}"
@@ -57,11 +56,7 @@ if [[ "${DEPLOY_VBMA}" != "true" ]]; then
   exit 0
 fi
 
-# ---- Marketplace (best-effort, parameter-driven) ----
-# This section uses a simple managed application resource deployment.
-# You must ensure the offer details are correct for your subscription/region.
-# The parameters file contains publisher/offer/plan values you can adjust quickly.
-
+# ---- Marketplace deployment (Managed App) ----
 PARAM_FILE="${REPO_ROOT}/marketplace/vbazure.parameters.json"
 if [[ ! -f "${PARAM_FILE}" ]]; then
   echo "ERROR: Missing ${PARAM_FILE}"
@@ -73,90 +68,87 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "==> Reading marketplace parameters from ${PARAM_FILE}"
-PUBLISHER="$(jq -r '.parameters.publisher.value' "${PARAM_FILE}")"
-OFFER="$(jq -r '.parameters.offer.value' "${PARAM_FILE}")"
-PLAN="$(jq -r '.parameters.plan.value' "${PARAM_FILE}")"
-PLAN_VERSION="$(jq -r '.parameters.planVersion.value // empty' "${PARAM_FILE}")"
-APP_NAME="$(jq -r '.parameters.managedApplicationName.value' "${PARAM_FILE}")"
-MRG_NAME="$(jq -r '.parameters.managedResourceGroupName.value' "${PARAM_FILE}")"
-
-if [[ -z "${PUBLISHER}" || -z "${OFFER}" || -z "${PLAN}" ]]; then
-  echo "ERROR: publisher/offer/plan missing in ${PARAM_FILE}"
-  exit 1
-fi
-
-echo "==> Accepting marketplace terms (publisher=${PUBLISHER}, offer=${OFFER}, plan=${PLAN}, version=${PLAN_VERSION:-<none>})"
-# NOTE: Azure CLI does *not* support a --version flag for terms acceptance.
-# Different Azure CLI versions/offer types expose different commands; try both (best-effort).
-az vm image terms accept --publisher "${PUBLISHER}" --offer "${OFFER}" --plan "${PLAN}" 1>/dev/null 2>/dev/null || \
-  az marketplace ordering agreement accept --publisher "${PUBLISHER}" --offer "${OFFER}" --plan "${PLAN}" 1>/dev/null 2>/dev/null || true
-
-# Create managed resource group id
-MRG_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${MRG_NAME}"
-
-echo "==> Deploying Veeam Backup for Microsoft Azure managed app: ${APP_NAME}"
-# Deploy via an ARM template for a managed application resource.
-# IMPORTANT: Avoid process substitution (<(...)) because it breaks on some shells (e.g., Git Bash on Windows)
-# with errors like: [Errno 2] No such file or directory: '/proc/.../fd/...'
-TMP_TEMPLATE="$(mktemp -t vbma-template-XXXXXX.json)"
+# jq can fail with "Invalid numeric literal" if the file has a UTF-8 BOM.
+# Create a sanitized temp copy and always read from that.
+SANITIZED_PARAM_FILE="$(mktemp -t vbazure-params-XXXXXX.json)"
 cleanup() {
-  rm -f "${TMP_TEMPLATE}" 2>/dev/null || true
+  rm -f "${SANITIZED_PARAM_FILE}" 2>/dev/null || true
+  rm -f "${APP_PARAMS_FILE:-}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
-cat >"${TMP_TEMPLATE}" <<'ARM'
-{
-  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-  "contentVersion": "1.0.0.0",
-  "parameters": {
-    "managedApplicationName": { "type": "string" },
-    "managedResourceGroupName": { "type": "string" },
-    "managedResourceGroupId": { "type": "string" },
-    "location": { "type": "string" },
+# Strip UTF-8 BOM if present (EF BB BF)
+# (sed is used instead of process substitution to keep Git Bash/Windows happy)
+sed '1s/^\xEF\xBB\xBF//' "${PARAM_FILE}" > "${SANITIZED_PARAM_FILE}"
 
-    "publisher": { "type": "string" },
-    "offer": { "type": "string" },
-    "plan": { "type": "string" },
-    "planVersion": { "type": "string", "defaultValue": "" },
+echo "==> Reading marketplace parameters from ${PARAM_FILE}"
+PUBLISHER="$(jq -r '.parameters.publisher.value' "${SANITIZED_PARAM_FILE}")"
+OFFER="$(jq -r '.parameters.offer.value' "${SANITIZED_PARAM_FILE}")"
+PLAN="$(jq -r '.parameters.plan.value' "${SANITIZED_PARAM_FILE}")"
+PLAN_VERSION="$(jq -r '.parameters.planVersion.value // empty' "${SANITIZED_PARAM_FILE}")"
+APP_NAME="$(jq -r '.parameters.managedApplicationName.value' "${SANITIZED_PARAM_FILE}")"
+MRG_NAME="$(jq -r '.parameters.managedResourceGroupName.value' "${SANITIZED_PARAM_FILE}")"
 
-    "appParameters": { "type": "object", "defaultValue": {} }
-  },
-  "resources": [
-    {
-      "type": "Microsoft.Solutions/applications",
-      "apiVersion": "2019-07-01",
-      "name": "[parameters('managedApplicationName')]",
-      "location": "[parameters('location')]",
-      "kind": "MarketPlace",
-      "plan": {
-        "name": "[parameters('plan')]",
-        "publisher": "[parameters('publisher')]",
-        "product": "[parameters('offer')]",
-        "version": "[parameters('planVersion')]"
-      },
-      "properties": {
-        "managedResourceGroupId": "[parameters('managedResourceGroupId')]",
-        "parameters": "[parameters('appParameters')]"
-      }
-    }
-  ],
-  "outputs": {
-    "managedApplicationId": {
-      "type": "string",
-      "value": "[resourceId('Microsoft.Solutions/applications', parameters('managedApplicationName'))]"
-    }
-  }
-}
-ARM
+if [[ -z "${PUBLISHER}" || -z "${OFFER}" || -z "${PLAN}" || -z "${APP_NAME}" || -z "${MRG_NAME}" ]]; then
+  echo "ERROR: Missing required marketplace values in ${PARAM_FILE}."
+  echo "       Need: publisher, offer, plan, managedApplicationName, managedResourceGroupName"
+  exit 1
+fi
 
-az deployment group create \
-  -g "${RG_NAME}" \
-  -n "vbma-$(date +%Y%m%d%H%M%S)" \
-  --parameters @"${PARAM_FILE}" \
-  --parameters managedResourceGroupId="${MRG_ID}" \
-  --template-file "${TMP_TEMPLATE}" \
-  1>/dev/null
+if [[ -z "${PLAN_VERSION}" ]]; then
+  echo "ERROR: planVersion is empty in ${PARAM_FILE}."
+  echo "       az managedapp create requires --plan-version for MarketPlace kind."
+  exit 1
+fi
+
+MRG_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${MRG_NAME}"
+
+echo "==> Accepting marketplace terms (publisher=${PUBLISHER}, offer=${OFFER}, plan=${PLAN})"
+# az term accept is the CLI command for marketplace terms; it does NOT take --version. :contentReference[oaicite:2]{index=2}
+# Some environments may not have it enabled (experimental), so we best-effort several options.
+az term accept --publisher "${PUBLISHER}" --product "${OFFER}" --plan "${PLAN}" 1>/dev/null 2>/dev/null || \
+  az vm image terms accept --publisher "${PUBLISHER}" --offer "${OFFER}" --plan "${PLAN}" 1>/dev/null 2>/dev/null || \
+  true
+
+# Extract appParameters.value to a file if it's not empty.
+# az managedapp create expects its own parameters payload (not the ARM deploymentParameters wrapper).
+APP_PARAMS_JSON="$(jq -c '.parameters.appParameters.value // {}' "${SANITIZED_PARAM_FILE}")"
+APP_PARAMS_FILE=""
+if [[ "${APP_PARAMS_JSON}" != "{}" ]]; then
+  APP_PARAMS_FILE="$(mktemp -t vbma-appparams-XXXXXX.json)"
+  printf '%s\n' "${APP_PARAMS_JSON}" > "${APP_PARAMS_FILE}"
+fi
+
+echo "==> Deploying Veeam Backup for Microsoft Azure managed app: ${APP_NAME}"
+# Use az managedapp create (supports plan-version, and avoids your ARM template param mismatch). :contentReference[oaicite:3]{index=3}
+if [[ -n "${APP_PARAMS_FILE}" ]]; then
+  az managedapp create \
+    -g "${RG_NAME}" \
+    -n "${APP_NAME}" \
+    -l "${LOCATION}" \
+    --kind MarketPlace \
+    -m "${MRG_ID}" \
+    --plan-name "${PLAN}" \
+    --plan-product "${OFFER}" \
+    --plan-publisher "${PUBLISHER}" \
+    --plan-version "${PLAN_VERSION}" \
+    --parameters @"${APP_PARAMS_FILE}" \
+    1>/dev/null
+else
+  az managedapp create \
+    -g "${RG_NAME}" \
+    -n "${APP_NAME}" \
+    -l "${LOCATION}" \
+    --kind MarketPlace \
+    -m "${MRG_ID}" \
+    --plan-name "${PLAN}" \
+    --plan-product "${OFFER}" \
+    --plan-publisher "${PUBLISHER}" \
+    --plan-version "${PLAN_VERSION}" \
+    1>/dev/null
+fi
 
 echo "==> Marketplace managed app deployment submitted."
+echo "    Managed app: ${APP_NAME}"
 echo "    Managed resource group: ${MRG_NAME}"
+echo "    Managed RG id: ${MRG_ID}"
