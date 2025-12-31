@@ -88,7 +88,7 @@ fi
 
 echo "==> Accepting marketplace terms (publisher=${PUBLISHER}, offer=${OFFER}, plan=${PLAN}, version=${PLAN_VERSION:-<none>})"
 if [[ -n "${PLAN_VERSION}" ]]; then
-  az vm image terms accept --publisher "${PUBLISHER}" --offer "${OFFER}" --plan "${PLAN}" --version "${PLAN_VERSION}" 1>/dev/null || true
+  az vm image terms accept --publisher "${PUBLISHER}" --offer "${OFFER}" --plan "${PLAN}" 1>/dev/null || true
 else
   az vm image terms accept --publisher "${PUBLISHER}" --offer "${OFFER}" --plan "${PLAN}" 1>/dev/null || true
 fi
