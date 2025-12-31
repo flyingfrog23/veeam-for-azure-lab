@@ -4,42 +4,40 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# Deploys the baseline lab (infra/main.bicep).
-# Optionally deploys the "Veeam Backup for Microsoft Azure" marketplace Managed App.
+die() { echo "ERROR: $*" >&2; exit 1; }
 
-# ---- Required env vars (or edit defaults below) ----
+# ---- Baseline (infra) env vars ----
 SUBSCRIPTION_ID="${SUBSCRIPTION_ID:-}"
-LOCATION="${LOCATION:-westeurope}"
+LOCATION="${LOCATION:-switzerlandnorth}"
 RG_NAME="${RG_NAME:-veeam-lab-rg}"
 PREFIX="${PREFIX:-veeam-lab}"
 
 ADMIN_USERNAME="${ADMIN_USERNAME:-veeamadmin}"
-ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"   # required unless you edit to prompt securely
+ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
 ALLOWED_RDP_SOURCE="${ALLOWED_RDP_SOURCE:-0.0.0.0/0}"
 
-# Marketplace toggle
-DEPLOY_VBMA="${DEPLOY_VBMA:-false}"  # true/false
+# ---- Marketplace toggle ----
+DEPLOY_VBMA="${DEPLOY_VBMA:-false}" # true/false
 
-# Marketplace values can come from ENV first; if empty, fall back to parameters file.
-VBMA_PARAM_FILE_DEFAULT="${REPO_ROOT}/marketplace/vbazure.parameters.json"
-
+# ---- Marketplace env vars (preferred) ----
 VBMA_PUBLISHER="${VBMA_PUBLISHER:-}"
 VBMA_OFFER="${VBMA_OFFER:-}"
 VBMA_PLAN="${VBMA_PLAN:-}"
 VBMA_PLAN_VERSION="${VBMA_PLAN_VERSION:-}"
 VBMA_APP_NAME="${VBMA_APP_NAME:-}"
 VBMA_MRG_NAME="${VBMA_MRG_NAME:-}"
-# Optional: app parameters JSON (object). If not set, will use appParameters.value from file or {}.
-VBMA_APP_PARAMS_JSON="${VBMA_APP_PARAMS_JSON:-}"
+
+# If true, delete the managed RG if it already exists (DANGEROUS).
+FORCE_RECREATE_MRG="${FORCE_RECREATE_MRG:-false}"
+
+# Parameters file fallback
+PARAM_FILE="${REPO_ROOT}/marketplace/vbazure.parameters.json"
 
 if [[ -z "${SUBSCRIPTION_ID}" ]]; then
-  echo "ERROR: SUBSCRIPTION_ID is required."
-  exit 1
+  die "SUBSCRIPTION_ID is required."
 fi
-
 if [[ -z "${ADMIN_PASSWORD}" ]]; then
-  echo "ERROR: ADMIN_PASSWORD is required (set env var)."
-  exit 1
+  die "ADMIN_PASSWORD is required (set env var)."
 fi
 
 echo "==> Setting subscription"
@@ -67,75 +65,48 @@ if [[ "${DEPLOY_VBMA}" != "true" ]]; then
   exit 0
 fi
 
+# ---- Marketplace deployment (Managed App) ----
 if ! command -v jq >/dev/null 2>&1; then
-  echo "ERROR: jq is required for marketplace deployment. Install jq or set DEPLOY_VBMA=false."
-  exit 1
+  die "jq is required for marketplace deployment. Install jq or set DEPLOY_VBMA=false."
 fi
 
-# If any marketplace vars are missing, try loading them from the parameters file
-PARAM_FILE="${VBMA_PARAM_FILE_DEFAULT}"
-SANITIZED_PARAM_FILE=""
+# Temp files (sanitize BOM + app params file)
+SANITIZED_PARAM_FILE="$(mktemp -t vbazure-params-XXXXXX.json)"
 APP_PARAMS_FILE=""
-
 cleanup() {
   rm -f "${SANITIZED_PARAM_FILE}" 2>/dev/null || true
   rm -f "${APP_PARAMS_FILE}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
-need_from_file=false
-for v in VBMA_PUBLISHER VBMA_OFFER VBMA_PLAN VBMA_PLAN_VERSION VBMA_APP_NAME VBMA_MRG_NAME; do
-  if [[ -z "${!v}" ]]; then
-    need_from_file=true
-    break
-  fi
-done
-
-if [[ "${need_from_file}" == "true" ]]; then
-  if [[ ! -f "${PARAM_FILE}" ]]; then
-    echo "ERROR: Marketplace env vars not fully set and missing parameters file:"
-    echo "       ${PARAM_FILE}"
-    echo "       Set VBMA_* env vars or provide ${PARAM_FILE}."
-    exit 1
-  fi
-
-  # jq can fail with "Invalid numeric literal" if the file has a UTF-8 BOM.
-  SANITIZED_PARAM_FILE="$(mktemp -t vbazure-params-XXXXXX.json)"
+# If we might need the file, ensure it exists and sanitize it (strip UTF-8 BOM).
+if [[ -f "${PARAM_FILE}" ]]; then
   sed '1s/^\xEF\xBB\xBF//' "${PARAM_FILE}" > "${SANITIZED_PARAM_FILE}"
+fi
 
-  echo "==> Reading marketplace parameters from ${PARAM_FILE}"
+# Helper: load missing vars from parameters file
+load_from_file_if_missing() {
+  [[ -f "${SANITIZED_PARAM_FILE}" ]] || return 0
 
-  # Only fill missing values from file; ENV stays authoritative.
+  # Only fill blanks; do not overwrite env-provided values.
   [[ -z "${VBMA_PUBLISHER}"     ]] && VBMA_PUBLISHER="$(jq -r '.parameters.publisher.value // empty' "${SANITIZED_PARAM_FILE}")"
   [[ -z "${VBMA_OFFER}"         ]] && VBMA_OFFER="$(jq -r '.parameters.offer.value // empty' "${SANITIZED_PARAM_FILE}")"
   [[ -z "${VBMA_PLAN}"          ]] && VBMA_PLAN="$(jq -r '.parameters.plan.value // empty' "${SANITIZED_PARAM_FILE}")"
   [[ -z "${VBMA_PLAN_VERSION}"  ]] && VBMA_PLAN_VERSION="$(jq -r '.parameters.planVersion.value // empty' "${SANITIZED_PARAM_FILE}")"
   [[ -z "${VBMA_APP_NAME}"      ]] && VBMA_APP_NAME="$(jq -r '.parameters.managedApplicationName.value // empty' "${SANITIZED_PARAM_FILE}")"
   [[ -z "${VBMA_MRG_NAME}"      ]] && VBMA_MRG_NAME="$(jq -r '.parameters.managedResourceGroupName.value // empty' "${SANITIZED_PARAM_FILE}")"
+}
 
-  # app params fallback from file only if env not set
-  if [[ -z "${VBMA_APP_PARAMS_JSON}" ]]; then
-    VBMA_APP_PARAMS_JSON="$(jq -c '.parameters.appParameters.value // {}' "${SANITIZED_PARAM_FILE}")"
-  fi
-fi
+echo "==> Loading marketplace parameters (env first; file fallback: ${PARAM_FILE})"
+load_from_file_if_missing
 
-# Validate required marketplace values
-if [[ -z "${VBMA_PUBLISHER}" || -z "${VBMA_OFFER}" || -z "${VBMA_PLAN}" || -z "${VBMA_PLAN_VERSION}" || -z "${VBMA_APP_NAME}" || -z "${VBMA_MRG_NAME}" ]]; then
-  echo "ERROR: Missing required marketplace values."
-  echo "       Need: VBMA_PUBLISHER, VBMA_OFFER, VBMA_PLAN, VBMA_PLAN_VERSION, VBMA_APP_NAME, VBMA_MRG_NAME"
-  echo "       (Either set env vars, or provide them in marketplace/vbazure.parameters.json)"
-  exit 1
-fi
-
-# Managed resource group must NOT exist; Azure will create it during managedapp create.
-if az group exists -n "${VBMA_MRG_NAME}" >/dev/null 2>&1; then
-  if [[ "$(az group exists -n "${VBMA_MRG_NAME}" -o tsv)" == "true" ]]; then
-    echo "ERROR: Managed resource group '${VBMA_MRG_NAME}' already exists."
-    echo "       For a Managed Application, Azure must create this RG."
-    echo "       Delete it (or choose a new VBMA_MRG_NAME / parameters value) and re-run."
-    exit 1
-  fi
-fi
+# Validate required marketplace params
+[[ -n "${VBMA_PUBLISHER}"    ]] || die "Missing VBMA_PUBLISHER (or publisher in ${PARAM_FILE})."
+[[ -n "${VBMA_OFFER}"        ]] || die "Missing VBMA_OFFER (or offer in ${PARAM_FILE})."
+[[ -n "${VBMA_PLAN}"         ]] || die "Missing VBMA_PLAN (or plan in ${PARAM_FILE})."
+[[ -n "${VBMA_PLAN_VERSION}" ]] || die "Missing VBMA_PLAN_VERSION (or planVersion in ${PARAM_FILE})."
+[[ -n "${VBMA_APP_NAME}"     ]] || die "Missing VBMA_APP_NAME (or managedApplicationName in ${PARAM_FILE})."
+[[ -n "${VBMA_MRG_NAME}"     ]] || die "Missing VBMA_MRG_NAME (or managedResourceGroupName in ${PARAM_FILE})."
 
 MRG_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${VBMA_MRG_NAME}"
 
@@ -143,63 +114,81 @@ echo "==> App RG: ${RG_NAME}"
 echo "==> Managed RG: ${VBMA_MRG_NAME}"
 echo "==> Managed RG id: ${MRG_ID}"
 
+# Managed RG must NOT exist. Azure creates it for Managed Applications.
+if az group exists -n "${VBMA_MRG_NAME}" | grep -qi true; then
+  if [[ "${FORCE_RECREATE_MRG}" == "true" ]]; then
+    echo "==> Managed resource group '${VBMA_MRG_NAME}' already exists; FORCE_RECREATE_MRG=true so deleting it..."
+    az group delete -n "${VBMA_MRG_NAME}" --yes --no-wait
+    echo "==> Waiting for managed RG deletion to complete..."
+    # Wait until it stops existing
+    for _ in {1..60}; do
+      if az group exists -n "${VBMA_MRG_NAME}" | grep -qi false; then
+        break
+      fi
+      sleep 5
+    done
+    if az group exists -n "${VBMA_MRG_NAME}" | grep -qi true; then
+      die "Managed RG '${VBMA_MRG_NAME}' still exists. Wait for deletion, then rerun."
+    fi
+  else
+    die "Managed resource group '${VBMA_MRG_NAME}' already exists.
+For a Managed Application, Azure must create this RG.
+Delete it (or set FORCE_RECREATE_MRG=true), or choose a new VBMA_MRG_NAME/parameters value."
+  fi
+fi
+
 echo "==> Accepting marketplace terms (publisher=${VBMA_PUBLISHER}, offer=${VBMA_OFFER}, plan=${VBMA_PLAN})"
-# Best-effort accept (some CLI builds differ)
+# az term accept does NOT take --version (you already saw that error); accept is best-effort.
 az term accept --publisher "${VBMA_PUBLISHER}" --product "${VBMA_OFFER}" --plan "${VBMA_PLAN}" 1>/dev/null 2>/dev/null || \
   az vm image terms accept --publisher "${VBMA_PUBLISHER}" --offer "${VBMA_OFFER}" --plan "${VBMA_PLAN}" 1>/dev/null 2>/dev/null || \
   true
 
-# Validate/normalize VBMA_APP_PARAMS_JSON (must be a JSON object)
-if [[ -z "${VBMA_APP_PARAMS_JSON}" ]]; then
-  VBMA_APP_PARAMS_JSON="{}"
-fi
+# appParameters handling:
+# - If env var VBMA_APP_PARAMETERS_JSON is provided, use it (must be valid JSON).
+# - Else if parameters file contains .parameters.appParameters.value, use it (can be {}).
+VBMA_APP_PARAMETERS_JSON="${VBMA_APP_PARAMETERS_JSON:-}"
 
-# This ensures we don't pass broken JSON like "{}}
-# If it's not valid JSON, fail fast.
-if ! echo "${VBMA_APP_PARAMS_JSON}" | jq -e '.' >/dev/null 2>&1; then
-  echo "ERROR: VBMA_APP_PARAMS_JSON is not valid JSON."
-  echo "       Value was: ${VBMA_APP_PARAMS_JSON}"
-  exit 1
-fi
-
-# If non-empty object, write to a temp file for --parameters @file
-if [[ "$(echo "${VBMA_APP_PARAMS_JSON}" | jq -c 'if type=="object" and length>0 then "nonempty" else "empty" end')" == "\"nonempty\"" ]]; then
+if [[ -n "${VBMA_APP_PARAMETERS_JSON}" ]]; then
+  # Validate JSON
+  echo "${VBMA_APP_PARAMETERS_JSON}" | jq -e . >/dev/null || die "VBMA_APP_PARAMETERS_JSON is not valid JSON."
   APP_PARAMS_FILE="$(mktemp -t vbma-appparams-XXXXXX.json)"
-  printf '%s\n' "${VBMA_APP_PARAMS_JSON}" > "${APP_PARAMS_FILE}"
+  printf '%s\n' "${VBMA_APP_PARAMETERS_JSON}" > "${APP_PARAMS_FILE}"
+elif [[ -f "${SANITIZED_PARAM_FILE}" ]]; then
+  APP_PARAMS_JSON="$(jq -c '.parameters.appParameters.value // {}' "${SANITIZED_PARAM_FILE}")"
+  echo "${APP_PARAMS_JSON}" | jq -e . >/dev/null || die "appParameters.value in ${PARAM_FILE} is not valid JSON."
+  if [[ "${APP_PARAMS_JSON}" != "{}" ]]; then
+    APP_PARAMS_FILE="$(mktemp -t vbma-appparams-XXXXXX.json)"
+    printf '%s\n' "${APP_PARAMS_JSON}" > "${APP_PARAMS_FILE}"
+  fi
 fi
 
 echo "==> Deploying Veeam Backup for Microsoft Azure managed app: ${VBMA_APP_NAME}"
-
-# IMPORTANT: Use long option --managed-rg-id to avoid weird parsing issues in some shells.
-# Also: DO NOT pre-create the managed RG; Azure will create it.
 if [[ -n "${APP_PARAMS_FILE}" ]]; then
   az managedapp create \
     -g "${RG_NAME}" \
     -n "${VBMA_APP_NAME}" \
     -l "${LOCATION}" \
     --kind MarketPlace \
-    --managed-rg-id "${MRG_ID}" \
+    -m "${MRG_ID}" \
     --plan-name "${VBMA_PLAN}" \
     --plan-product "${VBMA_OFFER}" \
     --plan-publisher "${VBMA_PUBLISHER}" \
     --plan-version "${VBMA_PLAN_VERSION}" \
-    --parameters @"${APP_PARAMS_FILE}" \
-    1>/dev/null
+    --parameters @"${APP_PARAMS_FILE}"
 else
   az managedapp create \
     -g "${RG_NAME}" \
     -n "${VBMA_APP_NAME}" \
     -l "${LOCATION}" \
     --kind MarketPlace \
-    --managed-rg-id "${MRG_ID}" \
+    -m "${MRG_ID}" \
     --plan-name "${VBMA_PLAN}" \
     --plan-product "${VBMA_OFFER}" \
     --plan-publisher "${VBMA_PUBLISHER}" \
-    --plan-version "${VBMA_PLAN_VERSION}" \
-    1>/dev/null
+    --plan-version "${VBMA_PLAN_VERSION}"
 fi
 
 echo "==> Marketplace managed app deployment submitted."
 echo "    Managed app: ${VBMA_APP_NAME}"
-echo "    Managed resource group (will be created by Azure): ${VBMA_MRG_NAME}"
+echo "    Managed resource group (Azure will create): ${VBMA_MRG_NAME}"
 echo "    Managed RG id: ${MRG_ID}"
