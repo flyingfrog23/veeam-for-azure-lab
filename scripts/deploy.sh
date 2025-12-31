@@ -88,7 +88,8 @@ fi
 
 echo "==> Accepting marketplace terms (publisher=${PUBLISHER}, offer=${OFFER}, plan=${PLAN}, version=${PLAN_VERSION:-<none>})"
 if [[ -n "${PLAN_VERSION}" ]]; then
-  az vm image terms accept --publisher "${PUBLISHER}" --offer "${OFFER}" --plan "${PLAN}" 1>/dev/null || true
+  # Some offers require an explicit version when accepting terms
+  az vm image terms accept --publisher "${PUBLISHER}" --offer "${OFFER}" --plan "${PLAN}" --version "${PLAN_VERSION}" 1>/dev/null || true
 else
   az vm image terms accept --publisher "${PUBLISHER}" --offer "${OFFER}" --plan "${PLAN}" 1>/dev/null || true
 fi
@@ -96,15 +97,22 @@ fi
 # Create managed resource group id
 MRG_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${MRG_NAME}"
 
-echo "==> Deploying Veeam Backup for Microsoft Azure managed app: ${APP_NAME}"
-# Deploy via inline ARM template for a managed application resource.
-# The "appParameters" object is passed through to the marketplace solution.
-az deployment group create \
-  -g "${RG_NAME}" \
-  -n "vbma-$(date +%Y%m%d%H%M%S)" \
-  --parameters @"${PARAM_FILE}" \
-  --parameters managedResourceGroupId="${MRG_ID}" \
-  --template-file <(cat <<'ARM'
+# IMPORTANT: Avoid process substitution (<(...)) because on Git Bash/Windows it becomes /proc/<pid>/fd/<n>
+# and Azure CLI (Python) may fail with: [Errno 2] No such file or directory.
+# Use a real temporary file instead.
+TMP_DIR="${TMPDIR:-${TEMP:-/tmp}}"
+TEMPLATE_FILE="$(mktemp "${TMP_DIR%/}/vbma-template.XXXXXX.json" 2>/dev/null || true)"
+if [[ -z "${TEMPLATE_FILE}" || ! -w "$(dirname "${TEMPLATE_FILE:-/tmp/vbma-template.json}")" ]]; then
+  # Fallback if mktemp behaves oddly on the platform
+  TEMPLATE_FILE="${TMP_DIR%/}/vbma-template.$(date +%s).json"
+fi
+
+cleanup() {
+  rm -f "${TEMPLATE_FILE}" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+cat > "${TEMPLATE_FILE}" <<'ARM'
 {
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
   "contentVersion": "1.0.0.0",
@@ -146,7 +154,17 @@ az deployment group create \
   }
 }
 ARM
-) 1>/dev/null
+
+echo "==> Deploying Veeam Backup for Microsoft Azure managed app: ${APP_NAME}"
+# Deploy via ARM template for a managed application resource.
+# The "appParameters" object is passed through to the marketplace solution.
+az deployment group create \
+  -g "${RG_NAME}" \
+  -n "vbma-$(date +%Y%m%d%H%M%S)" \
+  --parameters @"${PARAM_FILE}" \
+  --parameters managedResourceGroupId="${MRG_ID}" \
+  --template-file "${TEMPLATE_FILE}" \
+  1>/dev/null
 
 echo "==> Marketplace managed app deployment submitted."
 echo "    Managed resource group: ${MRG_NAME}"
