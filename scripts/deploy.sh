@@ -87,32 +87,25 @@ if [[ -z "${PUBLISHER}" || -z "${OFFER}" || -z "${PLAN}" ]]; then
 fi
 
 echo "==> Accepting marketplace terms (publisher=${PUBLISHER}, offer=${OFFER}, plan=${PLAN}, version=${PLAN_VERSION:-<none>})"
-if [[ -n "${PLAN_VERSION}" ]]; then
-  # Some offers require an explicit version when accepting terms
-  az vm image terms accept --publisher "${PUBLISHER}" --offer "${OFFER}" --plan "${PLAN}" --version "${PLAN_VERSION}" 1>/dev/null || true
-else
-  az vm image terms accept --publisher "${PUBLISHER}" --offer "${OFFER}" --plan "${PLAN}" 1>/dev/null || true
-fi
+# NOTE: Azure CLI does *not* support a --version flag for terms acceptance.
+# Different Azure CLI versions/offer types expose different commands; try both (best-effort).
+az vm image terms accept --publisher "${PUBLISHER}" --offer "${OFFER}" --plan "${PLAN}" 1>/dev/null 2>/dev/null || \
+  az marketplace ordering agreement accept --publisher "${PUBLISHER}" --offer "${OFFER}" --plan "${PLAN}" 1>/dev/null 2>/dev/null || true
 
 # Create managed resource group id
 MRG_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${MRG_NAME}"
 
-# IMPORTANT: Avoid process substitution (<(...)) because on Git Bash/Windows it becomes /proc/<pid>/fd/<n>
-# and Azure CLI (Python) may fail with: [Errno 2] No such file or directory.
-# Use a real temporary file instead.
-TMP_DIR="${TMPDIR:-${TEMP:-/tmp}}"
-TEMPLATE_FILE="$(mktemp "${TMP_DIR%/}/vbma-template.XXXXXX.json" 2>/dev/null || true)"
-if [[ -z "${TEMPLATE_FILE}" || ! -w "$(dirname "${TEMPLATE_FILE:-/tmp/vbma-template.json}")" ]]; then
-  # Fallback if mktemp behaves oddly on the platform
-  TEMPLATE_FILE="${TMP_DIR%/}/vbma-template.$(date +%s).json"
-fi
-
+echo "==> Deploying Veeam Backup for Microsoft Azure managed app: ${APP_NAME}"
+# Deploy via an ARM template for a managed application resource.
+# IMPORTANT: Avoid process substitution (<(...)) because it breaks on some shells (e.g., Git Bash on Windows)
+# with errors like: [Errno 2] No such file or directory: '/proc/.../fd/...'
+TMP_TEMPLATE="$(mktemp -t vbma-template-XXXXXX.json)"
 cleanup() {
-  rm -f "${TEMPLATE_FILE}" 2>/dev/null || true
+  rm -f "${TMP_TEMPLATE}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
-cat > "${TEMPLATE_FILE}" <<'ARM'
+cat >"${TMP_TEMPLATE}" <<'ARM'
 {
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
   "contentVersion": "1.0.0.0",
@@ -125,6 +118,7 @@ cat > "${TEMPLATE_FILE}" <<'ARM'
     "publisher": { "type": "string" },
     "offer": { "type": "string" },
     "plan": { "type": "string" },
+    "planVersion": { "type": "string", "defaultValue": "" },
 
     "appParameters": { "type": "object", "defaultValue": {} }
   },
@@ -138,7 +132,8 @@ cat > "${TEMPLATE_FILE}" <<'ARM'
       "plan": {
         "name": "[parameters('plan')]",
         "publisher": "[parameters('publisher')]",
-        "product": "[parameters('offer')]"
+        "product": "[parameters('offer')]",
+        "version": "[parameters('planVersion')]"
       },
       "properties": {
         "managedResourceGroupId": "[parameters('managedResourceGroupId')]",
@@ -155,15 +150,12 @@ cat > "${TEMPLATE_FILE}" <<'ARM'
 }
 ARM
 
-echo "==> Deploying Veeam Backup for Microsoft Azure managed app: ${APP_NAME}"
-# Deploy via ARM template for a managed application resource.
-# The "appParameters" object is passed through to the marketplace solution.
 az deployment group create \
   -g "${RG_NAME}" \
   -n "vbma-$(date +%Y%m%d%H%M%S)" \
   --parameters @"${PARAM_FILE}" \
   --parameters managedResourceGroupId="${MRG_ID}" \
-  --template-file "${TEMPLATE_FILE}" \
+  --template-file "${TMP_TEMPLATE}" \
   1>/dev/null
 
 echo "==> Marketplace managed app deployment submitted."
