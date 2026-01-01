@@ -2,20 +2,18 @@
 set -euo pipefail
 
 # Deploy baseline lab (infra/main.bicep) and optionally the VBMA Marketplace Managed App.
-#
-# Usage:
-#   export SUBSCRIPTION_ID=...
-#   export ADMIN_PASSWORD=...
-#   ./deploy.sh
-#
-# Optional:
-#   DEPLOY_VBMA=true
-#   VBMA_MARKETPLACE_FILE=marketplace/vbazure.marketplace.json
-#
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-source "${REPO_ROOT}/.env"
+
+# ---- Load .env from repo root (if present) ----
+ENV_FILE="${REPO_ROOT}/.env"
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
 
 # ---- Baseline lab ----
 SUBSCRIPTION_ID="${SUBSCRIPTION_ID:?SUBSCRIPTION_ID is required}"
@@ -32,6 +30,11 @@ DEPLOY_VBMA="${DEPLOY_VBMA:-false}"
 VBMA_APP_NAME="${VBMA_APP_NAME:-veeam-vbma-lab}"
 VBMA_MRG_NAME="${VBMA_MRG_NAME:-veeam-vbma-mrg}"
 VBMA_MARKETPLACE_FILE="${VBMA_MARKETPLACE_FILE:-${REPO_ROOT}/marketplace/vbazure.marketplace.json}"
+
+# Resolve relative marketplace path against repo root
+if [[ "${VBMA_MARKETPLACE_FILE}" != /* ]]; then
+  VBMA_MARKETPLACE_FILE="${REPO_ROOT}/${VBMA_MARKETPLACE_FILE}"
+fi
 
 az account set --subscription "${SUBSCRIPTION_ID}"
 
@@ -66,10 +69,8 @@ PLAN="$(jq -r '.plan' "${VBMA_MARKETPLACE_FILE}")"
 PLAN_VERSION="$(jq -r '.planVersion' "${VBMA_MARKETPLACE_FILE}")"
 APP_PARAMS_JSON="$(jq -c '.appParameters // {}' "${VBMA_MARKETPLACE_FILE}")"
 
-# Managed resource group must NOT already exist (Azure will create/own it)
 if [[ "$(az group exists -n "${VBMA_MRG_NAME}")" == "true" ]]; then
   echo "ERROR: Managed resource group '${VBMA_MRG_NAME}' already exists." >&2
-  echo "Delete it or set VBMA_MRG_NAME to a new name, then re-run." >&2
   exit 1
 fi
 
