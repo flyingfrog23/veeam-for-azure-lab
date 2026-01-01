@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-set -euo pipefail
 
 # -----------------------------
 # Paths
@@ -27,7 +26,6 @@ fi
 
 LOCATION="${LOCATION:-westeurope}"
 VBMA_APP_NAME="${VBMA_APP_NAME:-veeam-vbma-lab}"
-VBMA_MRG_NAME_BASE="${VBMA_MRG_NAME:-veeam-vbma-mrg}"
 
 # Resolve marketplace file path
 if [[ "${VBMA_MARKETPLACE_FILE}" != /* ]]; then
@@ -60,16 +58,6 @@ PLAN_VERSION="$(jq -r '.planVersion' "${VBMA_MARKETPLACE_FILE}")"
 APP_PARAMS_JSON="$(jq -c '.appParameters // {}' "${VBMA_MARKETPLACE_FILE}")"
 
 # -----------------------------
-# Managed RG (unique, Azure-owned)
-# -----------------------------
-TS="$(date +%Y%m%d%H%M%S)"
-VBMA_MRG_NAME="${VBMA_MRG_NAME_BASE}-${TS}"
-MRG_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${VBMA_MRG_NAME}"
-
-echo "==> Using managed resource group:"
-echo "${MRG_ID}" | cat -v
-
-# -----------------------------
 # Accept Marketplace terms
 # -----------------------------
 echo "==> Accepting Marketplace terms (best-effort)"
@@ -94,6 +82,7 @@ fi
 # Deploy managed app
 # -----------------------------
 echo "==> Deploying VBMA managed app: ${VBMA_APP_NAME}"
+echo "==> Azure will auto-generate the managed resource group name"
 
 if [[ -n "${APP_PARAMS_FILE}" ]]; then
   az managedapp create \
@@ -101,7 +90,6 @@ if [[ -n "${APP_PARAMS_FILE}" ]]; then
     --name "${VBMA_APP_NAME}" \
     --location "${LOCATION}" \
     --kind MarketPlace \
-    --managed-rg-id "${MRG_ID}" \
     --plan-name "${PLAN}" \
     --plan-product "${OFFER}" \
     --plan-publisher "${PUBLISHER}" \
@@ -113,7 +101,6 @@ else
     --name "${VBMA_APP_NAME}" \
     --location "${LOCATION}" \
     --kind MarketPlace \
-    --managed-rg-id "${MRG_ID}" \
     --plan-name "${PLAN}" \
     --plan-product "${OFFER}" \
     --plan-publisher "${PUBLISHER}" \
@@ -121,3 +108,5 @@ else
 fi
 
 echo "==> VBMA deployment submitted."
+echo "==> Check the managed app to see the auto-generated managed resource group:"
+echo "    az managedapp show -g ${RG_NAME} -n ${VBMA_APP_NAME} --query managedResourceGroupId -o tsv"
